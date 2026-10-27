@@ -6,7 +6,6 @@ use App\Models\Branch;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\InventoryMovement;
-use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
 
@@ -53,7 +52,9 @@ class SaleController extends Controller
                 }
 
                 $product = \App\Models\Product::findOrFail($request->product_id);
-                $user = User::first(); // Usamos nuestro usuario creado en el Seeder
+
+                // CAMBIO 1: antes era User::first() (el primero de la tabla)
+                $user = auth()->user();
                 $newStock = $pivot->stock - $request->quantity;
                 $total = $product->base_price * $request->quantity;
 
@@ -113,7 +114,7 @@ class SaleController extends Controller
             InventoryMovement::create([
                 'branch_id' => $request->branch_id,
                 'product_id' => $request->product_id,
-                'user_id' => User::first()->id,
+                'user_id' => auth()->user()->id, // CAMBIO 2: antes era User::first()->id
                 'type' => 'in',
                 'quantity' => $request->quantity,
                 'previous_stock' => $pivot->stock,
@@ -150,7 +151,7 @@ class SaleController extends Controller
                     ->where('product_id', $request->product_id)
                     ->lockForUpdate()->first();
 
-                $userId = User::first()->id;
+                $userId = auth()->user()->id; // CAMBIO 3: antes era User::first()->id
                 $newOriginStock = $origin->stock - $request->quantity;
                 DB::table('branch_product')->where('id', $origin->id)->update(['stock' => $newOriginStock, 'updated_at' => now()]);
 

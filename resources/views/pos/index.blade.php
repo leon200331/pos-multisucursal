@@ -19,6 +19,12 @@
                         @endforeach
                     </select>
                 </form>
+                <!-- CAMBIO (Paso 9): usuario con sesión activa + botón Salir -->
+                <span class="text-sm">👤 {{ auth()->user()->name }} ({{ auth()->user()->role }})</span>
+                <form method="POST" action="{{ route('logout') }}">
+                    @csrf
+                    <button class="bg-red-500 text-white px-3 py-1 rounded">Salir</button>
+                </form>
             </div>
         </div>
 
