@@ -30,72 +30,91 @@ class SaleController extends Controller
         return view('pos.index', compact('branches', 'currentBranch', 'products', 'sales', 'movements', 'totalSales'));
     }
 
-    public function store(Request $request)
-    {
-        $request->validate([
-            'branch_id' => 'required|exists:branches,id',
-            'product_id' => 'required|exists:products,id',
-            'quantity' => 'required|integer|min:1',
-        ]);
+public function store(Request $request)
+{
+    $request->validate([
+        'branch_id' => 'required|exists:branches,id',
+        'items' => 'required|array|min:1',
+        'items.*.product_id' => 'required|exists:products,id',
+        'items.*.quantity' => 'required|integer|min:1',
+    ]);
 
-        try {
-            DB::transaction(function () use ($request) {
-                // 1. Bloquear fila en tabla pivote para evitar ventas duplicadas simultáneas
-                $pivot = DB::table('branch_product')
-                    ->where('branch_id', $request->branch_id)
-                    ->where('product_id', $request->product_id)
-                    ->lockForUpdate()
-                    ->first();
+    try {
+        DB::transaction(function () use ($request) {
+            $branchId = $request->branch_id;
+            $user = auth()->user();
 
-                if (!$pivot || $pivot->stock < $request->quantity) {
-                    throw new \Exception('Stock insuficiente en esta sucursal.');
+            // 1. Juntar cantidades por producto (si el mismo vino repetido, se suma)
+            $quantities = collect($request->items)
+                ->groupBy('product_id')
+                ->map(fn ($group) => $group->sum('quantity'));
+
+            // 2. Bloquear TODAS las filas necesarias en UNA sola consulta
+            $pivots = DB::table('branch_product')
+                ->where('branch_id', $branchId)
+                ->whereIn('product_id', $quantities->keys())
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('product_id');
+
+            // 3. Verificar el stock de TODO antes de escribir algo
+            foreach ($quantities as $productId => $qty) {
+                $pivot = $pivots->get($productId);
+                if (!$pivot || $pivot->stock < $qty) {
+                    $product = \App\Models\Product::find($productId);
+                    throw new \Exception("Stock insuficiente de '{$product->name}' (disponible: " . ($pivot->stock ?? 0) . ").");
                 }
+            }
 
-                $product = \App\Models\Product::findOrFail($request->product_id);
+            // 4. Calcular el total general y crear la cabecera
+            $products = \App\Models\Product::whereIn('id', $quantities->keys())->get()->keyBy('id');
 
-                // CAMBIO 1: antes era User::first() (el primero de la tabla)
-                $user = auth()->user();
-                $newStock = $pivot->stock - $request->quantity;
-                $total = $product->base_price * $request->quantity;
+            $total = 0;
+            foreach ($quantities as $productId => $qty) {
+                $total += $products[$productId]->base_price * $qty;
+            }
 
-                // 2. Actualizar stock en la sucursal
-                DB::table('branch_product')
-                    ->where('id', $pivot->id)
+            $sale = Sale::create([
+                'branch_id' => $branchId,
+                'user_id' => $user->id,
+                'total' => $total,
+            ]);
+
+            // 5. Un renglón por producto: SaleItem + descuento de stock + kardex
+            foreach ($quantities as $productId => $qty) {
+                $product = $products[$productId];
+                $pivot = $pivots[$productId];
+                $newStock = $pivot->stock - $qty;
+
+                DB::table('branch_product')->where('id', $pivot->id)
                     ->update(['stock' => $newStock, 'updated_at' => now()]);
-
-                // 3. Crear cabecera y detalle de la venta
-                $sale = Sale::create([
-                    'branch_id' => $request->branch_id,
-                    'user_id' => $user->id,
-                    'total' => $total,
-                ]);
 
                 SaleItem::create([
                     'sale_id' => $sale->id,
                     'product_id' => $product->id,
-                    'quantity' => $request->quantity,
+                    'quantity' => $qty,
                     'unit_price' => $product->base_price,
-                    'subtotal' => $total,
+                    'subtotal' => $product->base_price * $qty,
                 ]);
 
-                // 4. Registrar auditoría en el Kardex
                 InventoryMovement::create([
-                    'branch_id' => $request->branch_id,
+                    'branch_id' => $branchId,
                     'product_id' => $product->id,
                     'user_id' => $user->id,
                     'type' => 'out',
-                    'quantity' => $request->quantity,
+                    'quantity' => $qty,
                     'previous_stock' => $pivot->stock,
                     'new_stock' => $newStock,
                     'reference' => 'Venta #' . $sale->id,
                 ]);
-            });
+            }
+        });
 
-            return back()->with('success', 'Venta registrada y stock actualizado.');
-        } catch (\Exception $e) {
-            return back()->with('error', $e->getMessage());
-        }
+        return back()->with('success', 'Venta registrada y stock actualizado.');
+    } catch (\Exception $e) {
+        return back()->with('error', $e->getMessage());
     }
+}
 
     public function restock(Request $request)
     {
