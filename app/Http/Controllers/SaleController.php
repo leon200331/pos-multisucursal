@@ -27,94 +27,165 @@ class SaleController extends Controller
             ->take(5)
             ->get();
 
-        return view('pos.index', compact('branches', 'currentBranch', 'products', 'sales', 'movements', 'totalSales'));
+        return view('pos.index', compact('branches', 'currentBranch', 'products', 'sales', 'movements', 'totalSales'))
+            ->with('stripeReturn', $request->get('stripe_return'));
     }
 
-public function store(Request $request)
-{
-    $request->validate([
-        'branch_id' => 'required|exists:branches,id',
-        'items' => 'required|array|min:1',
-        'items.*.product_id' => 'required|exists:products,id',
-        'items.*.quantity' => 'required|integer|min:1',
-    ]);
+    public function store(Request $request)
+    {
+        $request->validate([
+            'branch_id' => 'required|exists:branches,id',
+            'items' => 'required|array|min:1',
+            'items.*.product_id' => 'required|exists:products,id',
+            'items.*.quantity' => 'required|integer|min:1',
+        ]);
 
-    try {
-        DB::transaction(function () use ($request) {
-            $branchId = $request->branch_id;
-            $user = auth()->user();
+        try {
+            DB::transaction(function () use ($request) {
+                $user = auth()->user();
 
-            // 1. Juntar cantidades por producto (si el mismo vino repetido, se suma)
-            $quantities = collect($request->items)
-                ->groupBy('product_id')
-                ->map(fn ($group) => $group->sum('quantity'));
+                $quantities = collect($request->items)
+                    ->groupBy('product_id')
+                    ->map(fn ($group) => $group->sum('quantity'));
 
-            // 2. Bloquear TODAS las filas necesarias en UNA sola consulta
-            $pivots = DB::table('branch_product')
-                ->where('branch_id', $branchId)
-                ->whereIn('product_id', $quantities->keys())
-                ->lockForUpdate()
-                ->get()
-                ->keyBy('product_id');
+                $sale = Sale::create([
+                    'branch_id' => $request->branch_id,
+                    'user_id' => $user->id,
+                    'total' => 0,
+                    'status' => 'paid',
+                    'payment_method' => 'cash',
+                    'paid_at' => now(),
+                ]);
 
-            // 3. Verificar el stock de TODO antes de escribir algo
-            foreach ($quantities as $productId => $qty) {
-                $pivot = $pivots->get($productId);
-                if (!$pivot || $pivot->stock < $qty) {
-                    $product = \App\Models\Product::find($productId);
-                    throw new \Exception("Stock insuficiente de '{$product->name}' (disponible: " . ($pivot->stock ?? 0) . ").");
-                }
+                $total = $this->processItems($sale, $quantities);
+                $sale->update(['total' => $total]);
+            });
+
+            return back()->with('success', 'Venta en efectivo registrada.');
+        } catch (\Exception $e) {
+            return back()->with('error', $e->getMessage());
+        }
+    }
+
+    public function checkoutWithCard(Request $request)
+    {
+        $request->validate([
+            'branch_id' => 'required|exists:branches,id',
+            'items' => 'required|array|min:1',
+            'items.*.product_id' => 'required|exists:products,id',
+            'items.*.quantity' => 'required|integer|min:1',
+        ]);
+
+        try {
+            // 1. Crear la venta PENDIENTE y reservar el stock, en una transacción
+            $sale = DB::transaction(function () use ($request) {
+                $user = auth()->user();
+
+                $quantities = collect($request->items)
+                    ->groupBy('product_id')
+                    ->map(fn ($group) => $group->sum('quantity'));
+
+                $sale = Sale::create([
+                    'branch_id' => $request->branch_id,
+                    'user_id' => $user->id,
+                    'total' => 0,
+                    'status' => 'pending',
+                    'payment_method' => 'card',
+                ]);
+
+                $total = $this->processItems($sale, $quantities);
+                $sale->update(['total' => $total]);
+
+                return $sale->fresh()->load('items.product');
+            });
+
+            // 2. Pedirle a Stripe una página de pago (FUERA de la transacción de BD)
+            $stripe = new \Stripe\StripeClient(config('services.stripe.secret'));
+
+            $lineItems = [];
+            foreach ($sale->items as $item) {
+                $lineItems[] = [
+                    'price_data' => [
+                        'currency' => 'mxn',
+                        'unit_amount' => (int) round($item->unit_price * 100),
+                        'product_data' => ['name' => $item->product->name],
+                    ],
+                    'quantity' => $item->quantity,
+                ];
             }
 
-            // 4. Calcular el total general y crear la cabecera
-            $products = \App\Models\Product::whereIn('id', $quantities->keys())->get()->keyBy('id');
-
-            $total = 0;
-            foreach ($quantities as $productId => $qty) {
-                $total += $products[$productId]->base_price * $qty;
-            }
-
-            $sale = Sale::create([
-                'branch_id' => $branchId,
-                'user_id' => $user->id,
-                'total' => $total,
+            $session = $stripe->checkout->sessions->create([
+                'mode' => 'payment',
+                'line_items' => $lineItems,
+                'success_url' => route('pos.index', ['branch_id' => $sale->branch_id, 'stripe_return' => 'success']),
+                'cancel_url' => route('pos.index', ['branch_id' => $sale->branch_id, 'stripe_return' => 'cancel']),
+                'metadata' => ['sale_id' => (string) $sale->id],
             ]);
 
-            // 5. Un renglón por producto: SaleItem + descuento de stock + kardex
-            foreach ($quantities as $productId => $qty) {
-                $product = $products[$productId];
-                $pivot = $pivots[$productId];
-                $newStock = $pivot->stock - $qty;
+            $sale->update(['stripe_checkout_session_id' => $session->id]);
 
-                DB::table('branch_product')->where('id', $pivot->id)
-                    ->update(['stock' => $newStock, 'updated_at' => now()]);
-
-                SaleItem::create([
-                    'sale_id' => $sale->id,
-                    'product_id' => $product->id,
-                    'quantity' => $qty,
-                    'unit_price' => $product->base_price,
-                    'subtotal' => $product->base_price * $qty,
-                ]);
-
-                InventoryMovement::create([
-                    'branch_id' => $branchId,
-                    'product_id' => $product->id,
-                    'user_id' => $user->id,
-                    'type' => 'out',
-                    'quantity' => $qty,
-                    'previous_stock' => $pivot->stock,
-                    'new_stock' => $newStock,
-                    'reference' => 'Venta #' . $sale->id,
-                ]);
-            }
-        });
-
-        return back()->with('success', 'Venta registrada y stock actualizado.');
-    } catch (\Exception $e) {
-        return back()->with('error', $e->getMessage());
+            // 3. Mandar al cliente a la página de pago de Stripe
+            return redirect()->away($session->url);
+        } catch (\Exception $e) {
+            return back()->with('error', $e->getMessage());
+        }
     }
-}
+
+    private function processItems(Sale $sale, \Illuminate\Support\Collection $quantities): float
+    {
+        $user = auth()->user();
+        $branchId = $sale->branch_id;
+
+        $pivots = DB::table('branch_product')
+            ->where('branch_id', $branchId)
+            ->whereIn('product_id', $quantities->keys())
+            ->lockForUpdate()
+            ->get()
+            ->keyBy('product_id');
+
+        foreach ($quantities as $productId => $qty) {
+            $pivot = $pivots->get($productId);
+            if (!$pivot || $pivot->stock < $qty) {
+                $product = \App\Models\Product::find($productId);
+                throw new \Exception("Stock insuficiente de '{$product->name}' (disponible: " . ($pivot->stock ?? 0) . ").");
+            }
+        }
+
+        $products = \App\Models\Product::whereIn('id', $quantities->keys())->get()->keyBy('id');
+        $total = 0;
+
+        foreach ($quantities as $productId => $qty) {
+            $product = $products[$productId];
+            $pivot = $pivots[$productId];
+            $newStock = $pivot->stock - $qty;
+
+            DB::table('branch_product')->where('id', $pivot->id)
+                ->update(['stock' => $newStock, 'updated_at' => now()]);
+
+            SaleItem::create([
+                'sale_id' => $sale->id,
+                'product_id' => $product->id,
+                'quantity' => $qty,
+                'unit_price' => $product->base_price,
+                'subtotal' => $product->base_price * $qty,
+            ]);
+
+            InventoryMovement::create([
+                'branch_id' => $branchId,
+                'product_id' => $product->id,
+                'user_id' => $user->id,
+                'type' => 'out',
+                'quantity' => $qty,
+                'previous_stock' => $pivot->stock,
+                'new_stock' => $newStock,
+                'reference' => 'Venta #' . $sale->id . ($sale->payment_method === 'card' ? ' (reserva tarjeta)' : ''),
+            ]);
+
+            $total += $product->base_price * $qty;
+        }
+
+        return $total;
+    }
 
     public function restock(Request $request)
     {
@@ -133,7 +204,7 @@ public function store(Request $request)
             InventoryMovement::create([
                 'branch_id' => $request->branch_id,
                 'product_id' => $request->product_id,
-                'user_id' => auth()->user()->id, // CAMBIO 2: antes era User::first()->id
+                'user_id' => auth()->user()->id,
                 'type' => 'in',
                 'quantity' => $request->quantity,
                 'previous_stock' => $pivot->stock,
@@ -170,7 +241,7 @@ public function store(Request $request)
                     ->where('product_id', $request->product_id)
                     ->lockForUpdate()->first();
 
-                $userId = auth()->user()->id; // CAMBIO 3: antes era User::first()->id
+                $userId = auth()->user()->id;
                 $newOriginStock = $origin->stock - $request->quantity;
                 DB::table('branch_product')->where('id', $origin->id)->update(['stock' => $newOriginStock, 'updated_at' => now()]);
 

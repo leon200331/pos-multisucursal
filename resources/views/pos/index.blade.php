@@ -30,7 +30,15 @@
         @if(session('success')) <div class="bg-green-100 text-green-800 p-3 rounded">{{ session('success') }}</div> @endif
         @if(session('error')) <div class="bg-red-100 text-red-800 p-3 rounded">{{ session('error') }}</div> @endif
 
-        <!-- CAMBIO 1: Panel del carrito de la venta actual -->
+        <!-- FASE 3 (8b): Banners de retorno de Stripe -->
+        @if($stripeReturn == 'success')
+            <div class="bg-blue-100 text-blue-800 p-3 rounded">Pago recibido en pantalla. Esperando confirmación del webhook para marcar la venta como PAGADA.</div>
+        @endif
+        @if($stripeReturn == 'cancel')
+            <div class="bg-yellow-100 text-yellow-800 p-3 rounded">El cliente canceló el pago. La venta quedó PENDIENTE (stock reservado).</div>
+        @endif
+
+        <!-- Panel del carrito de la venta actual -->
         <div class="bg-white p-4 rounded shadow">
             <h2 class="font-bold mb-3">🛒 Carrito de la venta actual</h2>
             <table class="w-full text-left border-collapse" id="cart-table">
@@ -44,11 +52,15 @@
             <p id="cart-empty" class="text-gray-500 text-sm">Todavía no hay productos. Usa el botón "+ Carrito".</p>
             <div class="flex justify-between items-center mt-4">
                 <span class="text-lg font-bold">Total: $<span id="cart-total">0.00</span></span>
-                <form id="checkout-form" method="POST" action="{{ route('pos.store') }}">
-                    @csrf
-                    <input type="hidden" name="branch_id" value="{{ $currentBranch->id }}">
-                    <button type="button" id="checkout-btn" class="bg-blue-600 text-white px-4 py-2 rounded font-bold">Cobrar venta</button>
-                </form>
+                <!-- FASE 3 (8c): dos botones, efectivo y tarjeta -->
+                <div class="flex gap-2">
+                    <form id="checkout-form" method="POST" action="{{ route('pos.store') }}">
+                        @csrf
+                        <input type="hidden" name="branch_id" value="{{ $currentBranch->id }}">
+                        <button type="button" id="checkout-btn" class="bg-blue-600 text-white px-4 py-2 rounded font-bold">Cobrar efectivo</button>
+                        <button type="button" id="card-btn" class="bg-indigo-600 text-white px-4 py-2 rounded font-bold">💳 Pagar con tarjeta</button>
+                    </form>
+                </div>
             </div>
         </div>
 
@@ -65,7 +77,6 @@
                         <td class="font-bold {{ $p->pivot->stock <= $p->pivot->min_stock ? 'text-red-600' : 'text-green-700' }}">
                             {{ $p->pivot->stock }} (Mín: {{ $p->pivot->min_stock }})
                         </td>
-                        <!-- CAMBIO 2: botón "+ Carrito" en lugar del formulario de Cobrar por producto -->
                         <td class="p-2 flex gap-2">
                             <button class="add-to-cart bg-blue-600 text-white px-3 py-1 rounded {{ $p->pivot->stock < 1 ? 'opacity-40 pointer-events-none' : '' }}"
                                     data-id="{{ $p->id }}"
@@ -145,7 +156,7 @@
         </div>
     </div>
 
-    <!-- CAMBIO 3: JavaScript del carrito -->
+    <!-- JavaScript del carrito -->
     <script>
         // El carrito vive en la memoria del navegador: [{ id, name, price, stock, quantity }]
         let cart = [];
@@ -208,20 +219,24 @@
             document.getElementById('cart-total').textContent = total.toFixed(2);
         }
 
-        document.getElementById('checkout-btn').addEventListener('click', () => {
+        // FASE 3 (8d): el mismo carrito se envía a efectivo o a tarjeta según el botón
+        function submitCart(action) {
             if (cart.length === 0) { alert('El carrito está vacío'); return; }
 
             const form = document.getElementById('checkout-form');
             form.querySelectorAll('input[name^="items"]').forEach(i => i.remove());
 
-            // Convertir el carrito a inputs ocultos con la notación items[indice][campo]
             cart.forEach((item, index) => {
                 addHidden(form, `items[${index}][product_id]`, item.id);
                 addHidden(form, `items[${index}][quantity]`, item.quantity);
             });
 
+            form.action = action;
             form.submit();
-        });
+        }
+
+        document.getElementById('checkout-btn').addEventListener('click', () => submitCart("{{ route('pos.store') }}"));
+        document.getElementById('card-btn').addEventListener('click', () => submitCart("{{ route('pos.checkout.card') }}"));
 
         function addHidden(form, name, value) {
             const input = document.createElement('input');
